@@ -74,6 +74,7 @@ class OpticalMul(_nn.Module):
             data = _torch.view_as_complex(data)
 
         data = data.transpose(-2, -1)
+        data = data.unsqueeze(-3)
         
         self.__avg_pool = _nn.AvgPool2d((1,
                                          int(self.__config.vector_size * self.__config.scale_by_x / data.size(-1))))
