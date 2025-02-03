@@ -89,8 +89,7 @@ class DataParallel(_nn.Module):
 
         scattered_input = _nn.parallel.scatter(input, self.devices, dim)
         broadcasted_other = _nn.parallel.comm.broadcast(other, self.devices)
-        replicas = [self.module.to(x) for x in self.devices]
-        # replicas = _nn.parallel.replicate(self.module, self.devices)
+        replicas = _nn.parallel.replicate(self.module.to(self.devices[0]), self.devices)
         
         stacked_input = [(scattered_input[i],) + (broadcasted_other[i],) for i in range(len(replicas))]
 
