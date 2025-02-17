@@ -246,6 +246,7 @@ class Propagator_fresnel_operator(_nn.Module):
 
 def _fourier_propagation(operator: _torch.Tensor,
                          field: _torch.Tensor) -> _torch.Tensor:
+    operator = _torch.view_as_complex(operator)
     return _fft.ifft2(_fft.fft2(field) * operator)
 
 def _fresnel_propagation(operator: _torch.Tensor,
