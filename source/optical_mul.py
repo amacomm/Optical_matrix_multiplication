@@ -1,106 +1,87 @@
 import torch as _torch
 import torch.nn as _nn
 from .config import Config as _Config
-from .propagator import Propagator as _Propagator
+from .propagator import PropagatorCrossLens as _PropCrossLens, PropagatorСylindLens as _PropСylindLens, PropagatorSinc as _PropSinc, Propagator as _Prop
 
 class OpticalMul(_nn.Module):
     """
     Класс системы, выполняющей оптически операцию умножения матрицы на матрицу.
- 
-    Поля:
-        Lens1: цилиндрическая линза.
-        Lens2: скрещенная линза.
     """
-    def __init__(self, propagator: _Propagator,
-                 config: _Config):
+    def __init__(self, config: _Config):
         """
         Конструктор класса.
  
         Args:
-            propagator: класс распространения светового поля в свободном пространстве.
             config: конфигурация расчётной системы.
         """
         super(OpticalMul, self).__init__()
-        self.propagator: _Propagator = propagator
-        self.__config: _Config = config
-        
-        Lens1 = _torch.exp(-1j * config.K / config.distance * config.X**2)
-        Lens2 = _torch.exp(-1j * config.K / 2 / config.distance * config.Y**2) * Lens1
-        
-        self.register_buffer('Lens1', _torch.view_as_real(Lens1).half(), persistent=True)
-        self.register_buffer('Lens2', _torch.view_as_real(Lens2).half(), persistent=True)
-        
-        self.__zero_count_by_x = int((config.array_size - config.vector_size * config.scale_by_x) / 2)
-        
-        self.__pad_vector = _nn.ZeroPad2d((self.__zero_count_by_x,
-                                           self.__zero_count_by_x,
-                                           int(config.array_size / 2 - config.scale_by_y / 2 + 0.5),
-                                           int(config.array_size / 2 - config.scale_by_y / 2)))
 
-        kron_vec_utils = _torch.ones((self.__config.scale_by_y, self.__config.scale_by_x))
-        kron_mat_utils = _torch.ones((self.__config.scale_by_x, self.__config.scale_by_x))
-        self.register_buffer('kron_vec_utils', kron_vec_utils.half(), persistent=True)
-        self.register_buffer('kron_mat_utils', kron_mat_utils.half(), persistent=True)
+        prop_one = _PropSinc(config.input_vector_plane, config.first_lens_plane, config)
+        prop_two = _PropCrossLens(config.first_lens_plane, config)
+        prop_three = _PropSinc(config.first_lens_plane, config.matrix_plane, config)
+        prop_four = _PropСylindLens(config.matrix_plane, config)
+        prop_five = _PropSinc(config.matrix_plane, config.second_lens_plane, config)
+        prop_six = _PropCrossLens(config.second_lens_plane, config).T
+        prop_seven = _PropSinc(config.second_lens_plane, config.output_vector_plane, config)
+
+        self._propagator_one: _Prop = prop_one + prop_two + prop_three + prop_four
+        self._propagator_two: _Prop = prop_five + prop_six + prop_seven
+
+        kron_vec_utils = _torch.ones((config.input_vector_split_y, config.input_vector_split_x))
+        kron_mat_utils = _torch.ones((config.matrix_split_x, config.matrix_split_y))
+        self.register_buffer('_kron_vec_utils', kron_vec_utils, persistent=True)
+        self.register_buffer('_kron_mat_utils', kron_mat_utils, persistent=True)
+        
+        self._avg_pool = _nn.AvgPool2d((1, config.result_vector_split))
 
     def prepare_vector(self, data: _torch.Tensor) -> _torch.Tensor:
         """
-        Метод подготовки матрицы A, как набора векторов столбцов, к подаче на вход системы.
+        Метод подготовки матрицы левой матрицы, как набора векторов столбцов, к подаче на вход системы.
 
         Args:
-            data: матрица амплитудного распределения
-            (ограничение значений в диапазоне [0, 1]).
+            data: матрица комплексной амплитуды распределений световых полей.
 
         Returns:
-            Матрицы содержащие вектора входной матрицы A.
+            Матрицы содержащие вектора левой матрицы.
         """
-        data = data.half().flip(-1)
+        data = data.cfloat().flip(-1)
         data = data.unsqueeze(-2)
-        data = _torch.kron(data.contiguous(), self.kron_vec_utils)
-        return self.__pad_vector(data)
+        data = _torch.kron(data.contiguous(), self._kron_vec_utils)
+        return data
 
     def prepare_matrix(self, data: _torch.Tensor) -> _torch.Tensor:
         """
-        Метод подготовки матрицы B к подаче на вход системы.
+        Метод подготовки правой матрицы к подаче на вход системы.
 
         Args:
-            data: матрица амплитудного/фазового распределения
-            (ограничение значений в диапазоне [0, 1] для аплитудного рапределения
-            или ограничение значений 1 по амплитуде и [-pi, pi] по фазе).
+            data: матрица комплексной амплитуды распределения светового поля.
 
         Returns:
-            Матрица B дополненая до размеров системы.
+            Матрица - оптический элемент в центре модели.
         """
         if (data.dim() > 4) and data.size(-1) == 2:
             data = _torch.view_as_complex(data)
 
-        data = data.transpose(-2, -1)
+        data = data.cfloat().transpose(-2, -1)
         data = data.unsqueeze(-3)
-        
-        self.__avg_pool = _nn.AvgPool2d((1,
-                                         int(self.__config.vector_size * self.__config.scale_by_x / data.size(-1))))
-        data = _torch.kron(data.contiguous(), self.kron_mat_utils)
-        
-        self.__zero_count_by_y = int((self.__config.array_size - data.size(-2)) / 2)
-        self.__pad_matrix = _nn.ZeroPad2d((self.__zero_count_by_x,
-                                           self.__zero_count_by_x,
-                                           self.__zero_count_by_y,
-                                           self.__zero_count_by_y))
-        return self.__pad_matrix(data)
+        data = _torch.kron(data.contiguous(), self._kron_mat_utils)
+        return data
 
     def prepare_out(self, field: _torch.Tensor) -> _torch.Tensor:
         """
         Метод получения результата матричного умножения.
 
         Args:
-            data: матрицы выходого распределения комплексного поля системы.
+            data: матрицы выходого распределения светового поля системы.
 
         Returns:
             Вектор столбец (амплитудное распределение).
         """
-        field = field.abs()
-        field = field[..., self.__zero_count_by_y: -self.__zero_count_by_y, int(self.__config.array_size / 2)]
-        field = self.__avg_pool(field)
-        return field.flip(-1)
+        ### Закоментированная часть кода - более физически корректный вариант работы модели,
+        ### однако, данный вариант кода будет требовать большое кол-во памяти во время обучения
+        field = field.abs().squeeze(-1) #**2
+        field = self._avg_pool(field)
+        return field.flip(-1) #**0.5
 
     def forward(self,
                 input: _torch.Tensor,
@@ -128,13 +109,8 @@ class OpticalMul(_nn.Module):
         """
         vec_field = self.prepare_vector(input)
         mat_field = self.prepare_matrix(other)
-        
-        Lens1 = _torch.view_as_complex(self.Lens1)
-        Lens2 = _torch.view_as_complex(self.Lens2)
 
-        vec_field = self.propagator(vec_field)
-        vec_field = self.propagator(vec_field * Lens2)
-        vec_field = self.propagator(vec_field * Lens1 * mat_field)
-        vec_field = self.propagator(vec_field * Lens2.T)
+        vec_field = self._propagator_one(vec_field)
+        vec_field = self._propagator_two(vec_field * mat_field)
 
         return self.prepare_out(vec_field)

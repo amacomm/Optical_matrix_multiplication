@@ -1,77 +1,100 @@
 import torch as _torch
 import torch.nn as _nn
-import torch.fft as _fft
 import numpy as _np
 from scipy.special import fresnel as _fresnel
-from scipy.linalg import toeplitz as _toeplitz
-from .config import Config as _Config
+from .config import ConfigOpticBase as _ConfigOpticBase, ConfigDesignPlane as _ConfigDesignPlane
+from typing import Tuple as _Tuple, Sequence as _Sequence
 
-class Propagator(_nn.Module):
+from abc import ABC as _ABC
+import collections as _collections
+
+class Propagator(_ABC, _nn.Module):
     """
-    Класс оператора распространения светового поля в свободном пространстве.
- 
+    Абстрактный класс вычисления распространения светового поля в среде.
+
     Поля:
-        selection: список номеров используемых длин волн.
+        operator_X: оператор отображающий распроcтранение светового поля вдоль оси абсцисс
+        operator_Y: оператор отображающий распроcтранение светового поля вдоль оси ординат
     """
-    def __init__(self, operator,
-                 config: _Config = _Config()):
-        """
-        Конструктор класса.
- 
-        Args:
-            operator: оператор распространения светового поля.
-            config: конфигурация расчётной системы.
-        """
+    def __init__(self, operator_X: _torch.Tensor, operator_Y: _torch.Tensor):
         super(Propagator, self).__init__()
-        self.set_config(config, operator)
-        self.selection = _torch.arange(self.__config.wavelength.size(0))
+        operator_X: _torch.Tensor = _torch.view_as_real(operator_X)
+        operator_Y: _torch.Tensor = _torch.view_as_real(operator_Y)
+        self.register_buffer('_operator_X', operator_X, persistent=True)
+        self.register_buffer('_operator_Y', operator_Y, persistent=True)
 
-    def set_config(self, config: _Config, operator):
+    @property
+    def operator_X(self) -> _torch.Tensor:
         """
-        Метод замены конфигурационных данных.
- 
-        Args:
-            config: конфигурация расчётной системы.
-            operator: оператор распространения светового поля.
-        """
-        self.__config: _Config = config
-        self.set_operator(operator)
-
-    def set_operator(self, operator):
-        """
-        Метод замены оператора распространения светового поля.
- 
-        Args:
-            operator: оператор распространения светового поля.
-        """
-        self.operator = operator
-        self.operator.set_config(self.__config)
-
-    def get_distance(self) -> float:
-        """
-        Метод получения дистанции распространения светового поля.
-        
         Returns:
-            Дистанция распространения светового поля.
+            оператор отображающий распроcтранение светового поля вдоль оси абсцисс
         """
-        return self.__config.distance
+        return _torch.view_as_complex(self._operator_X)
+    @property
+    def operator_Y(self) -> _torch.Tensor:
+        """
+        Returns:
+            оператор отображающий распроcтранение светового поля вдоль оси ординат
+        """
+        return _torch.view_as_complex(self._operator_Y)
 
-    def propagation(self, field: _torch.Tensor) -> _torch.Tensor:
+    def __operator_multiplication(self, first_X: _torch.Tensor,
+                                  second_X: _torch.Tensor,
+                                  first_Y: _torch.Tensor,
+                                  second_Y: _torch.Tensor)-> _Tuple[_torch.Tensor, _torch.Tensor]:
+        operator_Y = second_Y @ first_Y
+        operator_X = first_X @ second_X
+        return operator_X, operator_Y
+
+    def cat(self, propagators: _Sequence['Propagator']) -> 'Propagator':
         """
-        Метод распространения светового поля.
- 
+        Метод схлопывания операторов распространения.
+    
         Args:
-            field: распределение комплексной амплитуды светового поля.
+            propagators: последовательность для схлопывания
 
         Returns:
-            Распределение комплексной амплитуды светового поля,
-            после распространения.
+            новый пропогатор, заменяющих собой серию предыдущих
+
+        Warning:
+            порядок расположения пропагаторов в последовательности важен,
+            идёт от первого к последниму
         """
-        return self.operator(field, self.__config, self.selection)
+        operator_X: _torch.Tensor
+        operator_Y: _torch.Tensor
+        if not isinstance(propagators, _collections.abc.Sequence):
+            operator_X, operator_Y = self.__operator_multiplication(self.operator_X,
+                                                               propagators.operator_X,
+                                                               self.operator_Y,
+                                                               propagators.operator_Y)
+        else:
+            size = len(propagators)
+            operator_X = self.operator_X
+            operator_Y = self.operator_Y
+            for i in range(size):
+                operator_X, operator_Y = self.__operator_multiplication(operator_X,
+                                                                   propagators[i].operator_X,
+                                                                   operator_Y,
+                                                                   propagators[i].operator_Y)
+        return Propagator(operator_X, operator_Y)
+
+    def __add__(self, propagator: 'Propagator') -> 'Propagator':
+        """
+        Метод схлопывания двух пропагаторов.
+        Args:
+            propagator: пропагатор с которым нужно произвести схлопывание
+
+        Returns:
+            новый пропогатор, заменяющих собой оба предыдущих
+
+        Warning:
+            операция не комутативная
+        """
+        return self.cat(propagator)
 
     def forward(self, field: _torch.Tensor) -> _torch.Tensor:
         """
-        Метод распространения светового поля.
+        Метод распространения светового поля в среде.
  
         Args:
             field: распределение комплексной амплитуды светового поля.
@@ -80,176 +103,118 @@ class Propagator(_nn.Module):
             Распределение комплексной амплитуды светового поля,
             после распространения.
         """
-        return self.propagation(field)
+        return self.operator_Y @ field @ self.operator_X
 
-class Propagator_ASM_operator(_nn.Module):
+class PropagatorLens(Propagator):
     """
-    Класс оператора разложения светового поля по базису плоских волн.
+    Абстрактный класс распространения света в тонком оптическом элементе.
     """
-    def __init__(self):
-        super(Propagator_ASM_operator, self).__init__()
-
-    def set_config(self, config: _Config):
+    def transpose(self) -> 'PropagatorLens':
         """
-        Метод замены конфигурационных данных.
- 
-        Args:
-            config: конфигурация расчётной системы.
-        """
-        border = _np.pi * config.array_size / config.aperture_size
-        arr = _torch.linspace(-border, border, config.array_size + 1)[:config.array_size]
-        xv, yv = _torch.meshgrid(arr, arr, indexing='ij')
-        xx = xv**2 + yv**2
-        U = _torch.roll(xx, (int(config.array_size / 2), int(config.array_size / 2)), dims = (0, 1))
-        p = (config.K[:, None, None].cfloat()**2 - U[None, ...].cfloat())**0.5
-        operator = _torch.exp(1j * config.distance * p[:, None, ...])
-        self.register_buffer('operator', _torch.view_as_real(operator), persistent=True)
-        
-    def forward(self,
-                 field: _torch.Tensor,
-                 config: _Config,
-                 selection: _torch.Tensor) -> _torch.Tensor:
-        """
-        Метод распространения светового поля.
- 
-        Args:
-            field: распределение комплексной амплитуды светового поля.
-
+        Метод транспонирования тонкого оптического элемента.
         Returns:
-            Распределение комплексной амплитуды светового поля,
-            после распространения.
+           Новый элемент, транспонированный относительно оригинального.
         """
-        return _fourier_propagation(self.operator[selection], field)
+        obj = Propagator.__new__(PropagatorLens)
+        Propagator.__init__(obj, self.operator_Y, self.operator_X)
+        return obj
 
-class Propagator_sphere_operator(_nn.Module):
-    """
-    Класс оператора разложения светового поля по базису сферических волн.
-    """
-    def __init__(self):
-        super(Propagator_sphere_operator, self).__init__()
-
-    def set_config(self, config: _Config):
+    @property
+    def T(self) -> 'PropagatorLens':
         """
-        Метод замены конфигурационных данных.
- 
-        Args:
-            config: конфигурация расчётной системы.
-        """
-        r = ((config.X**2 + config.Y**2 + config.distance**2)**0.5)[None, :, :]
-
-        H = ((config.distance / 2 / _np.pi / r**2) * (1 / r - 1j * config.K[:, None, None].cdouble())
-             * _torch.exp(1j * config.K[:, None, None].cdouble() * r)).cfloat()
-        H = H * config.pixel_size**2
-        operator = _fft.fft2(_torch.roll(H, (int(config.array_size/2), int(config.array_size/2)), (1,2)))[:, None, ...]
-        self.register_buffer('operator', _torch.view_as_real(operator), persistent=True)
-        
-    def forward(self,
-                 field: _torch.Tensor,
-                 config: _Config,
-                 selection: _torch.Tensor) -> _torch.Tensor:
-        """
-        Метод распространения светового поля.
- 
-        Args:
-            field: распределение комплексной амплитуды светового поля.
-
         Returns:
-            Распределение комплексной амплитуды светового поля,
-            после распространения.
+           Новый элемент, транспонированный относительно текущего.
         """
-        return _fourier_propagation(self.operator[selection], field)
+        return self.transpose()
 
-class Propagator_sinc_operator(_nn.Module):
+class PropagatorCrossLens(PropagatorLens):
     """
-    Класс оператора разложения светового поля по базису sinc.
+    Класс распространения света в скрещенной линзе,
+    представленной тонким оптическим элементом.
     """
-    def __init__(self):
-        super(Propagator_sinc_operator, self).__init__()
-
-    def set_config(self, config: _Config):
+    def __init__(self, plane: _ConfigDesignPlane,
+                 config: _ConfigOpticBase):
         """
-        Метод замены конфигурационных данных.
- 
+        Конструктор класса скрещенной линзы.
+
         Args:
-            config: конфигурация расчётной системы.
+            plane: данные о расчётной плоскости элемента.
+            config: данные о световом поле модели.
         """
-        bndW = 0.5 / config.pixel_size
-        eikz = (_torch.exp(1j * config.K * config.distance)**0.5)[:, None]
+        operator_X = _torch.exp(-1j * config.K / config.distance * plane.linspace_by_x**2)
+        operator_Y = _torch.exp(-1j * config.K / 2 / config.distance * plane.linspace_by_y**2)
+        super(PropagatorCrossLens, self).__init__(_torch.diag_embed(operator_X),
+                                                  _torch.diag_embed(operator_Y))
+
+class PropagatorСylindLens(PropagatorLens):
+    """
+    Класс распространения света в цилиндрической линзе,
+    представленной тонким оптическим элементом.
+    """
+    def __init__(self, plane: _ConfigDesignPlane,
+                 config: _ConfigOpticBase):
+        """
+        Конструктор класса цилиндрической линзы.
+
+        Args:
+            plane: данные о расчётной плоскости элемента.
+            config: данные о световом поле модели.
+        """
+        operator_X = _torch.exp(-1j * config.K / config.distance * plane.linspace_by_x**2)
+        operator_Y = _torch.ones_like(plane.linspace_by_y, dtype=_torch.cfloat)
+        super(PropagatorСylindLens, self).__init__(_torch.diag_embed(operator_X),
+                                                   _torch.diag_embed(operator_Y))
+
+class PropagatorSinc(Propagator):
+    """
+    Класс распространения света свободном пространстве
+    с использованием разложения по базисным sinc функциям.
+    """
+    def __init__(self, first_plane: _ConfigDesignPlane,
+                 second_plane: _ConfigDesignPlane,
+                 config: _ConfigOpticBase):
+        """
+        Конструктор класса распространения в свободном пространстве.
+
+        Args:
+            first_plane: данные о начальной расчётной плоскости.
+            second_plane: данные о конечной расчётной плоскости.
+            config: данные о световом поле модели.
+        """
+        operator_X, operator_Y = self.__get_operators(first_plane,
+                                                    second_plane,
+                                                    config)
+        super(PropagatorSinc, self).__init__(operator_X, operator_Y)
+
+    def __get_operator_for_dim(self,
+                             pixel_size_in: float,
+                             pixel_size_out: float,
+                             difference: float,
+                             config: _ConfigOpticBase) -> _torch.Tensor:
+        bndW = 0.5 / pixel_size_in
+        eikz = (_np.exp(1j * config.K * config.distance)**0.5)
         sq2p = (2 / _np.pi)**0.5
-        sqzk = ((2 * config.distance / config.K)**0.5)[:, None]
-        xm  = (config.X[:, 0] - config.Y[:, 0])[None, ...]
-        mu1 = -_np.pi * sqzk * bndW - xm / sqzk
-        mu2 = _np.pi * sqzk * bndW - xm / sqzk
+        sqzk = ((2 * config.distance / config.K)**0.5)
+        mu1 = -_np.pi * sqzk * bndW - difference / sqzk
+        mu2 = _np.pi * sqzk * bndW - difference / sqzk
         S1, C1 = _fresnel(mu1 * sq2p)
         S2, C2 = _fresnel(mu2 * sq2p)
-        operator = ((config.pixel_size / _np.pi) / sqzk * eikz
-                  * _torch.exp(0.5j * xm**2 * config.K[:, None] / config.distance)
+        return (((pixel_size_in * pixel_size_out)**0.5 / _np.pi) / sqzk * eikz
+                  * _np.exp(0.5j * difference**2 * config.K / config.distance)
                   * (C2 - C1 - 1j * (S2 - S1)) / sq2p)
-        operator = _torch.tensor(_np.stack([_toeplitz(operator[i], operator[i]) for i in range(operator.size(0))]))[:, None, ...]
-        self.register_buffer('operator', _torch.view_as_real(operator), persistent=True)
         
-    def forward(self,
-                 field: _torch.Tensor,
-                 config: _Config,
-                 selection: _torch.Tensor) -> _torch.Tensor:
-        """
-        Метод распространения светового поля.
- 
-        Args:
-            field: распределение комплексной амплитуды светового поля.
-
-        Returns:
-            Распределение комплексной амплитуды светового поля,
-            после распространения.
-        """
-        return _fresnel_propagation(self.operator[selection], field.cfloat())
-
-class Propagator_fresnel_operator(_nn.Module):
-    """
-    Класс оператора разложения светового поля по базису цилиндрических волн.
-    """
-    def __init__(self):
-        super(Propagator_fresnel_operator, self).__init__()
-
-    def set_config(self, config: _Config):
-        """
-        Метод замены конфигурационных данных.
- 
-        Args:
-            config: конфигурация расчётной системы.
-        """
-        d = config.pixel_size / 2
-        S1, C1 = _fresnel(((config.K / _np.pi / config.distance) ** 0.5)[:, None]
-                          * (config.X[0] - (config.Y[0] - d))[None, ...])
-        S2, C2 = _fresnel(((config.K / _np.pi / config.distance) ** 0.5)[:, None]
-                          * (config.X[0] - (config.Y[0] + d))[None, ...])
-        operator = (((C1 - C2) + 1j * (S1 - S2))
-                    * ((_torch.exp(1j * config.K * config.distance) / 2j) ** 0.5)[:, None])
-        operator = _torch.tensor(_np.stack([_toeplitz(operator[i], operator[i]) for i in range(operator.size(0))]))[:, None, ...]
-        self.register_buffer('operator', _torch.view_as_real(operator), persistent=True)
-        
-    def forward(self,
-                 field: _torch.Tensor,
-                 config: _Config,
-                 selection: _torch.Tensor) -> _torch.Tensor:
-        """
-        Метод распространения светового поля.
- 
-        Args:
-            field: распределение комплексной амплитуды светового поля.
-
-        Returns:
-            Распределение комплексной амплитуды светового поля,
-            после распространения.
-        """
-        return _fresnel_propagation(self.operator[selection], field.cfloat())
-
-def _fourier_propagation(operator: _torch.Tensor,
-                         field: _torch.Tensor) -> _torch.Tensor:
-    operator = _torch.view_as_complex(operator)
-    return _fft.ifft2(_fft.fft2(field) * operator)
-
-def _fresnel_propagation(operator: _torch.Tensor,
-                         field: _torch.Tensor) -> _torch.Tensor:
-    operator = _torch.view_as_complex(operator)
-    return operator @ field @ operator
+    def __get_operators(self,
+                      first_plane: _ConfigDesignPlane,
+                      second_plane: _ConfigDesignPlane,
+                      config: _ConfigOpticBase) -> _Tuple[_torch.Tensor, _torch.Tensor]:
+        difference_x = first_plane.linspace_by_x[None, :] - second_plane.linspace_by_x[:, None]
+        difference_y = first_plane.linspace_by_y[None, :] - second_plane.linspace_by_y[:, None]
+        operator_X = self.__get_operator_for_dim(first_plane.pixel_size_by_x,
+                                               second_plane.pixel_size_by_x,
+                                               difference_x,
+                                               config).transpose(-2, -1)
+        operator_Y = self.__get_operator_for_dim(first_plane.pixel_size_by_y,
+                                               second_plane.pixel_size_by_y,
+                                               difference_y,
+                                               config)
+        return operator_X, operator_Y
